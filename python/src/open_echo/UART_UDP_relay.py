@@ -1,9 +1,70 @@
+import argparse
+import socket
+
 import serial
 import serial.tools.list_ports
-import socket
-import argparse
 
 START_BYTE = 0xAA
+
+
+def configure_relay_parser(parser):
+    parser.add_argument(
+        "-p", "--uart-port",
+        help="UART device (e.g. COM3 or /dev/ttyUSB0)",
+    )
+
+    parser.add_argument(
+        "-b", "--baud-rate",
+        type=int,
+        default=250000,
+        help="UART baud rate (default: 250000)",
+    )
+
+    parser.add_argument(
+        "-n", "--samples",
+        type=int,
+        default=1800,
+        help="Number of samples per packet (default: 1800)",
+    )
+
+    parser.add_argument(
+        "--udp-ip",
+        default="127.0.0.1",
+        help="UDP target IP (default: 127.0.0.1)",
+    )
+
+    parser.add_argument(
+        "--udp-port",
+        type=int,
+        default=5005,
+        help="UDP target port (default: 5005)",
+    )
+
+    parser.add_argument(
+        "--broadcast",
+        action="store_true",
+        help="Enable UDP broadcast (255.255.255.255)",
+    )
+
+    parser.add_argument(
+        "--list-uart",
+        action="store_true",
+        help="List all available UART/serial ports and exit",
+    )
+
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress all non-error output",
+    )
+    verbosity.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose packet diagnostics",
+    )
+
+    return parser
 
 
 def list_uart_ports():
@@ -32,7 +93,7 @@ def read_raw_packet(ser, payload_size, verbose=False):
 
         if len(payload) != payload_size or len(checksum) != 1:
             if verbose:
-                print("⚠️  Incomplete packet")
+                print("Incomplete packet")
             continue
 
         # Verify checksum (XOR of payload bytes)
@@ -42,77 +103,22 @@ def read_raw_packet(ser, payload_size, verbose=False):
 
         if calc_checksum != checksum[0]:
             if verbose:
-                print("⚠️  Checksum mismatch (UART)")
+                print("Checksum mismatch (UART)")
             continue
 
         if verbose:
-            print("📦 Packet received (checksum OK)")
+            print("Packet received (checksum OK)")
 
         return header + payload + checksum
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="UART → UDP transparent relay"
-    )
-
-    parser.add_argument(
-        "-p", "--uart-port",
-        help="UART device (e.g. COM3 or /dev/ttyUSB0)"
-    )
-
-    parser.add_argument(
-        "-b", "--baud-rate",
-        type=int,
-        default=250000,
-        help="UART baud rate (default: 250000)"
-    )
-
-    parser.add_argument(
-        "-n", "--samples",
-        type=int,
-        default=1800,
-        help="Number of samples per packet (default: 1800)"
-    )
-
-    parser.add_argument(
-        "--udp-ip",
-        default="127.0.0.1",
-        help="UDP target IP (default: 127.0.0.1)"
-    )
-
-    parser.add_argument(
-        "--udp-port",
-        type=int,
-        default=5005,
-        help="UDP target port (default: 5005)"
-    )
-
-    parser.add_argument(
-        "--broadcast",
-        action="store_true",
-        help="Enable UDP broadcast (255.255.255.255)"
-    )
-
-    parser.add_argument(
-        "--list-uart",
-        action="store_true",
-        help="List all available UART/serial ports and exit"
-    )
-
-    verbosity = parser.add_mutually_exclusive_group()
-    verbosity.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress all non-error output"
-    )
-    verbosity.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose packet diagnostics"
-    )
-
-    args = parser.parse_args()
+def run_relay(args=None):
+    parser = None
+    if args is None or isinstance(args, list):
+        parser = configure_relay_parser(
+            argparse.ArgumentParser(description="UART → UDP transparent relay")
+        )
+        args = parser.parse_args(args)
 
     # ===== Handle list-uart and exit =====
     if args.list_uart:
@@ -121,8 +127,9 @@ def main():
 
     # Require UART port if not listing
     if not args.uart_port:
-        print("❌ Error: UART port must be specified with -p / --uart-port")
-        parser.print_help()
+        print("Error: UART port must be specified with -p / --uart-port")
+        if parser is not None:
+            parser.print_help()
         return
 
     payload_size = 6 + 2 * args.samples
@@ -151,7 +158,7 @@ def main():
     try:
         with serial.Serial(args.uart_port, args.baud_rate, timeout=1) as ser:
             if not args.quiet:
-                print("✅ UART connected, relaying packets...\n")
+                print("UART connected, relaying packets...\n")
 
             while True:
                 packet = read_raw_packet(
@@ -162,13 +169,9 @@ def main():
                 udp_sock.sendto(packet, (udp_ip, args.udp_port))
 
     except serial.SerialException as e:
-        print(f"❌ UART error: {e}")
+        print(f"UART error: {e}")
     except KeyboardInterrupt:
         if not args.quiet:
-            print("\n🛑 Relay stopped by user")
+            print("\nRelay stopped by user")
     finally:
         udp_sock.close()
-
-
-if __name__ == "__main__":
-    main()
