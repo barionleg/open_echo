@@ -29,8 +29,12 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast_json(self, data) -> None:
-        for connection in self.active_connections:
-            await connection.send_json(data)
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(data)
+            except Exception as e:
+                log.warning(f"WebSocket send failed, disconnecting client: {e}")
+                await self.disconnect(connection)
 
 
 class EchoReader:
