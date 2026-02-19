@@ -3,8 +3,7 @@ import socket
 
 import serial
 import serial.tools.list_ports
-
-START_BYTE = 0xAA
+from open_echo.echo import START_BYTE, compute_checksum, payload_size
 
 
 def configure_relay_parser(parser):
@@ -78,30 +77,25 @@ def list_uart_ports():
         print(f"  {port.device}  - {port.description}")
 
 
-def read_raw_packet(ser, payload_size, verbose=False):
+def read_raw_packet(ser, num_payload_bytes, verbose=False):
     """
     Reads and returns a FULL raw packet:
     b'\\xAA' + payload + checksum
     """
     while True:
         header = ser.read(1)
-        if header != bytes([START_BYTE]):
+        if not header or header[0] != START_BYTE:
             continue
 
-        payload = ser.read(payload_size)
+        payload = ser.read(num_payload_bytes)
         checksum = ser.read(1)
 
-        if len(payload) != payload_size or len(checksum) != 1:
+        if len(payload) != num_payload_bytes or len(checksum) != 1:
             if verbose:
                 print("Incomplete packet")
             continue
 
-        # Verify checksum (XOR of payload bytes)
-        calc_checksum = 0
-        for b in payload:
-            calc_checksum ^= b
-
-        if calc_checksum != checksum[0]:
+        if compute_checksum(payload) != checksum[0]:
             if verbose:
                 print("Checksum mismatch (UART)")
             continue
@@ -132,7 +126,7 @@ def run_relay(args=None):
             parser.print_help()
         return
 
-    payload_size = 6 + 2 * args.samples
+    pld_size = payload_size(args.samples)
     udp_ip = "255.255.255.255" if args.broadcast else args.udp_ip
 
     # ===== Startup banner =====
@@ -143,7 +137,7 @@ def run_relay(args=None):
         print(f" UART port      : {args.uart_port}")
         print(f" Baud rate      : {args.baud_rate}")
         print(f" Samples        : {args.samples}")
-        print(f" Payload size   : {payload_size} bytes")
+        print(f" Payload size   : {pld_size} bytes")
         print(f" UDP target IP  : {udp_ip}")
         print(f" UDP target port: {args.udp_port}")
         print(f" Broadcast mode : {'ON' if args.broadcast else 'OFF'}")
@@ -163,7 +157,7 @@ def run_relay(args=None):
             while True:
                 packet = read_raw_packet(
                     ser,
-                    payload_size,
+                    pld_size,
                     verbose=args.verbose and not args.quiet
                 )
                 udp_sock.sendto(packet, (udp_ip, args.udp_port))

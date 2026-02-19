@@ -43,7 +43,7 @@ class OutputManager:
                 output_class.last_output_time is None
                 or (
                     (asyncio.get_event_loop().time() - output_class.last_output_time)
-                    >= (output_class.output_interval * 1000)
+                    >= output_class.output_interval
                 )
             ):
                 output_class.last_output_time = asyncio.get_event_loop().time()

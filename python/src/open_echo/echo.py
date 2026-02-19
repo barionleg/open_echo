@@ -13,6 +13,27 @@ import serial_asyncio_fast as aserial
 if TYPE_CHECKING:
     from open_echo.settings import Settings
 
+START_BYTE = 0xAA
+PAYLOAD_HEADER_SIZE = 6
+
+
+def compute_checksum(payload: bytes) -> int:
+    """XOR checksum over all bytes in payload."""
+    chk = 0
+    for b in payload:
+        chk ^= b
+    return chk
+
+
+def payload_size(num_samples: int) -> int:
+    """Total payload size: 6-byte header + 1 byte per sample."""
+    return PAYLOAD_HEADER_SIZE + num_samples
+
+
+def packet_size(num_samples: int) -> int:
+    """Full packet size: start byte + payload + checksum byte."""
+    return 1 + payload_size(num_samples) + 1
+
 
 class EchoReadError(ValueError):
     pass
@@ -31,15 +52,11 @@ class EchoPacket:
 
     @classmethod
     def unpack(cls, payload: bytes, checksum: bytes, num_samples: int) -> "EchoPacket":
-        if len(payload) != 6 + num_samples or len(checksum) != 1:
+        if len(payload) != payload_size(num_samples) or len(checksum) != 1:
             raise EchoReadError("Invalid payload or checksum length")
 
         # Verify checksum
-        calc_checksum = 0
-        for byte in payload:
-            calc_checksum ^= byte
-        if calc_checksum != checksum[0]:
-            print("Checksum mismatch")
+        if compute_checksum(payload) != checksum[0]:
             raise ChecksumMismatchError("Checksum mismatch")
 
         # Unpack payload
@@ -117,7 +134,7 @@ class SerialReader(AsyncReader):
 
         while True:
             header = await self.reader.readexactly(1)
-            if header != b"\xaa":
+            if header[0] != START_BYTE:
                 continue  # Wait for the start byte
 
             payload = await self.reader.readexactly(
@@ -136,7 +153,7 @@ class UDPReader(AsyncReader):
         def datagram_received(self, data: bytes, addr):
             for b in data:
                 if not self.outer._buf:
-                    if b == 0xAA:
+                    if b == START_BYTE:
                         self.outer._buf.append(b)
                     else:
                         continue
@@ -162,7 +179,7 @@ class UDPReader(AsyncReader):
         self._transport = None
         self._queue: asyncio.Queue = asyncio.Queue()
         self._buf = bytearray()
-        self.packet_size = 1 + 6 + self.settings.num_samples + 1
+        self.packet_size = packet_size(self.settings.num_samples)
         self.host = getattr(settings, "udp_host", "0.0.0.0")
         self.port = getattr(settings, "udp_port", 9999)
 
