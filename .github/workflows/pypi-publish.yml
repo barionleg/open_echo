@@ -8,6 +8,7 @@ jobs:
   test-lint-typecheck:
     uses: ./.github/workflows/python-ci.yml
   build-and-publish:
+    needs: test-lint-typecheck
     runs-on: ubuntu-latest
     permissions:
       contents: write
