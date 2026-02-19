@@ -3,6 +3,7 @@ import logging
 from collections.abc import Callable, Coroutine
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Form, Request, WebSocket
 from fastapi.responses import RedirectResponse
@@ -36,8 +37,8 @@ class ConnectionManager:
 class EchoReader:
     def __init__(
         self,
-        data_callback: Callable[[dict], Coroutine],
-        depth_callback: Callable[[dict], Coroutine],
+        data_callback: Callable[[dict], Coroutine[Any, Any, None]],
+        depth_callback: Callable[[float], Coroutine[Any, Any, None]],
         settings=None,
     ):
         self.settings = settings
