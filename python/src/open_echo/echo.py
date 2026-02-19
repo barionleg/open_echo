@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import struct
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
@@ -9,6 +10,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 import serial.tools.list_ports
 import serial_asyncio_fast as aserial
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from open_echo.settings import Settings
@@ -56,7 +59,9 @@ class EchoPacket:
             raise EchoReadError("Invalid payload or checksum length")
 
         # Verify checksum
-        if compute_checksum(payload) != checksum[0]:
+        calc = compute_checksum(payload)
+        if calc != checksum[0]:
+            log.warning("Checksum mismatch: expected 0x%02X, got 0x%02X", checksum[0], calc)
             raise ChecksumMismatchError("Checksum mismatch")
 
         # Unpack payload
@@ -74,7 +79,7 @@ class EchoPacket:
 
 class AsyncReader(ABC):
     def __init__(self, settings: "Settings"):
-        print("AsyncReader initialized")
+        log.debug("AsyncReader initialized")
         self.settings = settings
 
     async def __aenter__(self) -> "AsyncReader":
@@ -106,7 +111,7 @@ class AsyncReader(ABC):
 
 class SerialReader(AsyncReader):
     def __init__(self, settings: "Settings"):
-        print("SerialReader initialized")
+        log.debug("SerialReader initialized")
         super().__init__(settings)
         self.reader: asyncio.StreamReader | None = None
         self.writer: asyncio.StreamWriter | None = None
@@ -138,11 +143,15 @@ class SerialReader(AsyncReader):
                 continue  # Wait for the start byte
 
             payload = await self.reader.readexactly(
-                6 + self.settings.num_samples
-            )  # Read payload
+                payload_size(self.settings.num_samples)
+            )
             checksum = await self.reader.readexactly(1)
 
-            return EchoPacket.unpack(payload, checksum, self.settings.num_samples)
+            try:
+                return EchoPacket.unpack(payload, checksum, self.settings.num_samples)
+            except ChecksumMismatchError:
+                log.warning("Serial: checksum mismatch, dropping packet")
+                continue
 
 
 class UDPReader(AsyncReader):
@@ -171,6 +180,8 @@ class UDPReader(AsyncReader):
                             payload, checksum, self.outer.settings.num_samples
                         )
                         self.outer._queue.put_nowait(result)
+                    except ChecksumMismatchError:
+                        log.warning("UDP: checksum mismatch, dropping packet")
                     finally:
                         self.outer._buf.clear()
 
@@ -184,14 +195,14 @@ class UDPReader(AsyncReader):
         self.port = getattr(settings, "udp_port", 9999)
 
     async def open(self):
-        print("Starting UDP listener...")
+        log.info("Starting UDP listener...")
         loop = asyncio.get_running_loop()
         transport, protocol = await loop.create_datagram_endpoint(
             lambda: UDPReader._PacketProtocol(self),
             local_addr=(self.host, self.port),
         )
         self._transport = transport
-        print(f"UDP listener bound to {self.host}:{self.port}")
+        log.info("UDP listener bound to %s:%d", self.host, self.port)
 
     async def close(self):
         if self._transport:

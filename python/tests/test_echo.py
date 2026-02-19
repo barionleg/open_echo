@@ -235,9 +235,8 @@ async def test_udpreader_protocol_checksum_mismatch_clears_buffer_and_does_not_e
     )
     bad_checksum = bytes([(checksum[0] ^ 0xFF) & 0xFF])
     packet = bytes([0xAA]) + payload + bad_checksum
-    # Protocol raises on checksum mismatch; ensure buffer clears and nothing enqueued
-    with pytest.raises(ChecksumMismatchError):
-        proto.datagram_received(packet, ("127.0.0.1", 1))
+    # Corrupted packet should be silently dropped, not raise
+    proto.datagram_received(packet, ("127.0.0.1", 1))
 
     # Verify queue is empty by timing out when trying to read
     with pytest.raises(asyncio.TimeoutError):
@@ -279,16 +278,7 @@ async def test_asyncreader_iterator_yields_until_cancelled():
 
 
 @pytest.mark.asyncio
-async def test_udpreader_open_and_close_monkeypatched_log():
-    # Patch a dummy logger into module to avoid NameError
-    import open_echo.echo as echo_mod
-
-    class DummyLog:
-        def info(self, *_args, **_kwargs):
-            return None
-
-    echo_mod.log = DummyLog()
-
+async def test_udpreader_open_and_close():
     settings = DummySettings(
         num_samples=8, udp_host="127.0.0.1", udp_port=0
     )  # use ephemeral port
