@@ -90,6 +90,7 @@ class EchoReader:
 
     async def run_forever(self):
         """Continuously read serial data and emit processed arrays. Supports live settings update and restart."""
+        retry_delay = 1  # seconds; doubles on each consecutive failure up to 30s max
         while True:
             if self.settings is None:
                 log.warning("Settings not initialized, waiting...")
@@ -104,12 +105,15 @@ class EchoReader:
                     async for pkt in reader:
                         await self.process_echo(pkt)
                         if self._restart_event.is_set():
-                            print("Restart event set, breaking loop")
+                            log.info("Restart event set, breaking loop")
                             break
+                retry_delay = 1  # reset backoff on clean exit
+                await self._restart_event.wait()
             except Exception as e:
                 log.error(f"❌ Error in EchoReader: {e}", exc_info=e)
-
-            await self._restart_event.wait()
+                log.info(f"Retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30)
 
 
 connection_manager = ConnectionManager()
