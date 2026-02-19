@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - 'documentation/**'
+      - '_config.yml'
+      - 'Gemfile'
+      - 'README.md'
 
 
 permissions:
