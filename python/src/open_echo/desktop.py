@@ -1,18 +1,15 @@
-# Async integration
+# Desktop client — connects to the web server's WebSocket for echo data.
+# If no web server is running, spawns one as a subprocess.
 import asyncio
-import socket
+import json
+import logging
+import subprocess
 import sys
-import time
+import threading
 
 import numpy as np
 import pyqtgraph as pg
 import qdarktheme
-import serial
-import serial.tools.list_ports
-from open_echo.echo import ConnectionTypeEnum
-
-# Use shared settings/readers
-from open_echo.settings import Settings
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import (
@@ -23,109 +20,286 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QVBoxLayout,
     QWidget,
 )
 from qasync import QEventLoop
 
-# Serial Configuration
-BAUD_RATE = 250000
-# Default values; overridden by WaterfallApp instance settings
-NUM_SAMPLES = 1800  # (X-axis)
+log = logging.getLogger(__name__)
 
 MAX_ROWS = 300  # Number of time steps (Y-axis)
 Y_LABEL_DISTANCE = 50  # distance between labels in cm
+DEFAULT_LEVELS = (0, 256)
 
-SPEED_OF_SOUND = 1440  # default sound speed meters/second in water
-# SPEED_OF_SOUND = 343  # default sound speed meters/second in water
-
-# SAMPLE_TIME = 52.226e-6  # 13.2 microseconds on Atmega328 max sample speed plus 50 microseconds delay in sampling loop
-# SAMPLE_TIME = 47.0e-6
-# SAMPLE_TIME = 41.666e-6 # 13.2 microseconds on Atmega328 max sample speed plus 40 microseconds delay in sampling loop
-# SAMPLE_TIME = 22.22e-6  # 13.2 microseconds on Atmega328 max sample speed plus 20 microseconds delay in sampling loop
-SAMPLE_TIME = (
-    13.2e-6  # 13.2 microseconds on Atmega328 max sample speed without additional delay
-)
-# SAMPLE_TIME = 11.0e-6     # 13.2 microseconds on RP2040 max sample speed with 10 microseconds additional delay per sample
-# SAMPLE_TIME = 7.682e-6  # 7.682 microseconds on STM32F103 max sample speed
-# SAMPLE_TIME = 6.0e-6  # 6 microseconds on RP2040 max sample speed with 5 microseconds additional delay per sample
-# SAMPLE_TIME = 1.290e-6     # 13.2 microseconds on RP2040 max sample speed without additional delay
-
-DEFAULT_LEVELS = (0, 256)  # Expected data range
-
-# Module-level derived values are kept for defaults only; instance values are used in UI
-SAMPLE_RESOLUTION = (SPEED_OF_SOUND * SAMPLE_TIME * 100) / 2
-PACKET_SIZE = 1 + 6 + NUM_SAMPLES + 1
-MAX_DEPTH = NUM_SAMPLES * SAMPLE_RESOLUTION
-depth_labels = {
-    int(i / SAMPLE_RESOLUTION): f"{i / 100}"
-    for i in range(0, int(MAX_DEPTH), Y_LABEL_DISTANCE)
-}
+# Default server URL
+DEFAULT_SERVER_URL = "http://localhost:8000"
 
 
-def generate_dbt_sentence(depth_cm):
-    depth_m = depth_cm / 100.0
-    depth_ft = depth_m * 3.28084
-    depth_fathoms = depth_m * 0.546807
-
-    # Format the DBT sentence without checksum
-    sentence_body = f"DBT,{depth_ft:.1f},f,{depth_m:.1f},M,{depth_fathoms:.1f},F"
-
-    # Compute checksum
-    checksum = 0
-    for char in sentence_body:
-        checksum ^= ord(char)
-
-    nmea_sentence = f"${sentence_body}*{checksum:02X}"
-    return nmea_sentence
+# ---------------------------------------------------------------------------
+# WebSocket client — receives echo data from the web server
+# ---------------------------------------------------------------------------
 
 
-def get_serial_ports():
-    """Retrieve a list of available serial ports."""
-    return [port.device for port in serial.tools.list_ports.comports()][::-1]
+class WebSocketClient(QObject):
+    """WebSocket client running in a background thread with its own event loop.
+
+    qasync's event loop doesn't support TCP ``create_connection``, so we run
+    the websockets client in a dedicated thread and bridge data back to Qt
+    via pyqtSignal.
+    """
+
+    packet_received = pyqtSignal(dict)
+    connection_changed = pyqtSignal(str)  # "connected", "reconnecting"
+
+    def __init__(self, server_url: str = DEFAULT_SERVER_URL):
+        super().__init__()
+        self.server_url = server_url.rstrip("/")
+        self._ws_url = (
+            self.server_url.replace("http://", "ws://").replace(
+                "https://", "wss://"
+            )
+            + "/ws"
+        )
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._thread_main, daemon=True, name="ws-client"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def _thread_main(self):
+        """Entry point for the background thread — runs its own asyncio loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._run())
+        finally:
+            loop.close()
+
+    async def _run(self):
+        import websockets
+
+        retry_delay = 1.0
+        while not self._stop_event.is_set():
+            try:
+                self.connection_changed.emit("reconnecting")
+                async with websockets.connect(self._ws_url) as ws:
+                    self.connection_changed.emit("connected")
+                    retry_delay = 1.0
+                    async for raw in ws:
+                        if self._stop_event.is_set():
+                            break
+                        try:
+                            data = json.loads(raw)
+                            self.packet_received.emit(data)
+                        except json.JSONDecodeError:
+                            log.warning("Invalid JSON from WebSocket")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.warning(
+                    "WebSocket error: %s — retrying in %.0fs", e, retry_delay
+                )
+                self.connection_changed.emit("reconnecting")
+                # Use stop_event.wait so we can exit promptly
+                if self._stop_event.wait(timeout=retry_delay):
+                    break
+                retry_delay = min(retry_delay * 2, 30.0)
 
 
-def get_local_ip():
+# ---------------------------------------------------------------------------
+# Web server lifecycle — auto-detect or spawn
+# ---------------------------------------------------------------------------
+
+
+class WebServerManager:
+    """Checks for an existing web server and spawns one if needed."""
+
+    def __init__(self, server_url: str = DEFAULT_SERVER_URL):
+        self.server_url = server_url.rstrip("/")
+        self._process: subprocess.Popen | None = None
+        self._owned = False  # True if we spawned the server
+
+    async def ensure_running(self) -> bool:
+        """Return True once the server is reachable. Spawns if needed."""
+        if await asyncio.get_event_loop().run_in_executor(
+            None, self._is_reachable
+        ):
+            log.info("Web server already running at %s", self.server_url)
+            return True
+
+        log.info("No web server found — spawning one...")
+        self._spawn()
+        # Wait for it to become reachable
+        for _ in range(60):  # up to ~30 s
+            await asyncio.sleep(0.5)
+            if await asyncio.get_event_loop().run_in_executor(
+                None, self._is_reachable
+            ):
+                log.info("Web server is now reachable")
+                return True
+
+        log.error("Web server failed to start within timeout")
+        return False
+
+    def _is_reachable(self) -> bool:
+        import urllib.request
+
+        try:
+            resp = urllib.request.urlopen(
+                f"{self.server_url}/api/settings", timeout=2
+            )
+            return resp.status == 200
+        except Exception:
+            return False
+
+    def _spawn(self):
+        self._process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "open_echo.web:app",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "8000",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._owned = True
+
+    def shutdown(self):
+        if self._owned and self._process:
+            log.info("Shutting down spawned web server (pid %d)", self._process.pid)
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=2)
+            self._process = None
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers — synchronous (run via executor from qasync loop)
+# ---------------------------------------------------------------------------
+
+
+def _fetch_settings_sync(server_url: str) -> dict | None:
+    import json
+    import urllib.request
+
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+        resp = urllib.request.urlopen(
+            f"{server_url}/api/settings", timeout=5
+        )
+        return json.loads(resp.read())
+    except Exception as e:
+        log.error("Failed to fetch settings: %s", e)
+        return None
+
+
+def _push_settings_sync(server_url: str, settings_dict: dict) -> dict | None:
+    import json
+    import urllib.request
+
+    try:
+        data = json.dumps(settings_dict).encode("utf-8")
+        req = urllib.request.Request(
+            f"{server_url}/api/settings",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        return json.loads(resp.read())
+    except Exception as e:
+        log.error("Failed to push settings: %s", e)
+        return None
+
+
+def _fetch_serial_ports_sync(server_url: str) -> list[str]:
+    import json
+    import urllib.request
+
+    try:
+        resp = urllib.request.urlopen(
+            f"{server_url}/api/serial-ports", timeout=5
+        )
+        return json.loads(resp.read())
+    except Exception as e:
+        log.error("Failed to fetch serial ports: %s", e)
+        return []
+
+
+async def fetch_settings(server_url: str) -> dict | None:
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _fetch_settings_sync, server_url
+    )
+
+
+async def push_settings(server_url: str, settings_dict: dict) -> dict | None:
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _push_settings_sync, server_url, settings_dict
+    )
+
+
+async def fetch_serial_ports(server_url: str) -> list[str]:
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _fetch_serial_ports_sync, server_url
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settings Dialog — local display + proxied echo settings
+# ---------------------------------------------------------------------------
 
 
 class SettingsDialog(QWidget):
+    settings_applied = pyqtSignal()
+
     def __init__(
         self,
         parent=None,
         current_gradient="cyclic",
-        current_speed=343,
-        current_num_samples=NUM_SAMPLES,
-        current_sample_time_us=SAMPLE_TIME * 1e6,
-        nmea_enabled=False,
-        nmea_port=10110,
-        nmea_address="127.0.0.1",
+        server_url: str = DEFAULT_SERVER_URL,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Chart Settings")
-        self.setFixedSize(340, 640)
-
         self.main_app = parent
+        self.server_url = server_url
+        self.setWindowTitle("Settings")
+        self.setFixedSize(380, 750)
 
-        # Outer layout for centering
+        # Populated asynchronously after show()
+        self._server_settings: dict = {}
+
         outer_layout = QVBoxLayout(self)
-        outer_layout.setAlignment(Qt.AlignCenter)
+        outer_layout.setAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
 
-        # === Card container ===
         card = QWidget()
+        card.setObjectName("Card")
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(20, 20, 20, 20)
-        card_layout.setSpacing(15)
+        card_layout.setSpacing(12)
 
-        # --- Color Map ---
+        # === Display Settings (local) ===
+        display_header = QLabel("Display")
+        display_header.setStyleSheet("font-weight: bold; font-size: 15px;")
+        card_layout.addWidget(display_header)
+
         card_layout.addWidget(QLabel("Color Map:"))
         self.gradient_dropdown = QComboBox()
         self.gradient_dropdown.addItems(
@@ -147,241 +321,279 @@ class SettingsDialog(QWidget):
         self.gradient_dropdown.setCurrentText(current_gradient)
         card_layout.addWidget(self.gradient_dropdown)
 
-        # --- Speed of Sound ---
-        card_layout.addWidget(QLabel("Speed of Sound:"))
-        self.speed_dropdown = QComboBox()
-        self.speed_dropdown.addItems(["343m/s (Air)", "1440m/s (Water)"])
-        self.speed_dropdown.setCurrentIndex(1 if current_speed == 1440 else 0)
-        card_layout.addWidget(self.speed_dropdown)
-
-        # --- Sampling Parameters ---
-        sampling_section = QVBoxLayout()
-        sampling_section.setSpacing(8)
-
-        sampling_label = QLabel("Sampling Parameters:")
-        sampling_label.setStyleSheet("font-weight: bold;")
-        sampling_section.addWidget(sampling_label)
-
-        # Number of Samples
-        ns_row = QHBoxLayout()
-        ns_label = QLabel("Num. Samples:")
-        ns_label.setMinimumWidth(100)
-        self.num_samples_input = QLineEdit()
-        self.num_samples_input.setPlaceholderText("e.g. 1800")
-        self.num_samples_input.setText(str(current_num_samples))
-        self.num_samples_input.setMaximumWidth(200)
-        ns_row.addWidget(ns_label)
-        ns_row.addWidget(self.num_samples_input)
-        ns_row.addStretch()
-        sampling_section.addLayout(ns_row)
-
-        # Sample Time (microseconds)
-        st_row = QHBoxLayout()
-        st_label = QLabel("Sample Time (µs):")
-        st_label.setMinimumWidth(100)
-        self.sample_time_input = QLineEdit()
-        self.sample_time_input.setPlaceholderText("e.g. 13.2")
-        # Accept display in microseconds for user convenience
-        self.sample_time_input.setText(f"{current_sample_time_us:.6f}")
-        self.sample_time_input.setMaximumWidth(200)
-        st_row.addWidget(st_label)
-        st_row.addWidget(self.sample_time_input)
-        st_row.addStretch()
-        sampling_section.addLayout(st_row)
-
-        card_layout.addLayout(sampling_section)
-
-        # --- NMEA Output Section ---
-        nmea_section = QVBoxLayout()
-        nmea_section.setSpacing(8)
-
-        # Section title
-        nmea_label = QLabel("NMEA TCP Output:")
-        nmea_label.setStyleSheet("font-weight: bold;")
-        nmea_section.addWidget(nmea_label)
-
-        # Enable checkbox
-        self.nmea_enable_checkbox = QCheckBox("Enable NMEA Output")
-        self.nmea_enable_checkbox.setStyleSheet(
-            "QCheckBox:hover { text-decoration: none; }"
-        )
-        nmea_section.addWidget(self.nmea_enable_checkbox)
-
-        # Address display row
-        addr_row = QHBoxLayout()
-        addr_label = QLabel("Address:")
-        addr_label.setMinimumWidth(60)
-
-        self.addr_display = QLabel(nmea_address)
-        self.addr_display.setStyleSheet("color: #cccccc; padding: 2px;")
-        self.addr_display.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
-        )  # Allow text copy
-
-        copy_button = QPushButton("Copy")
-        copy_button.setFixedHeight(22)
-        copy_button.setStyleSheet("font-size: 11px; padding: 2px 6px;")
-        copy_button.clicked.connect(
-            lambda: QApplication.clipboard().setText(nmea_address)
-        )
-
-        addr_row.addWidget(addr_label)
-        addr_row.addWidget(self.addr_display)
-        addr_row.addWidget(copy_button)
-        addr_row.addStretch()
-        nmea_section.addLayout(addr_row)
-
-        # Port input with label to the left
-        port_row = QHBoxLayout()
-
-        # --- Large Depth Display Option ---
         self.large_depth_checkbox = QCheckBox("Show Depth Display")
         self.large_depth_checkbox.setChecked(
             getattr(parent, "large_depth_visible", True)
         )
         card_layout.addWidget(self.large_depth_checkbox)
 
-        port_label = QLabel("Port:")
-        port_label.setMinimumWidth(40)
+        # === Echo Settings (proxied to web server) ===
+        echo_header = QLabel("Echo Sounder")
+        echo_header.setStyleSheet("font-weight: bold; font-size: 15px;")
+        card_layout.addWidget(echo_header)
 
-        self.port_input = QLineEdit()
-        self.port_input.setPlaceholderText("TCP Port (default: 10110)")
-        self.port_input.setText(str(nmea_port))
-        self.port_input.setMaximumWidth(200)
+        # Connection type
+        card_layout.addWidget(QLabel("Connection:"))
+        self.connection_type_dropdown = QComboBox()
+        self.connection_type_dropdown.addItems(["SERIAL", "UDP"])
+        self.connection_type_dropdown.currentTextChanged.connect(
+            self._on_connection_type_changed
+        )
+        card_layout.addWidget(self.connection_type_dropdown)
 
-        port_row.addWidget(port_label)
-        port_row.addWidget(self.port_input)
-        port_row.addStretch()
-        nmea_section.addLayout(port_row)
+        # Serial port
+        self.serial_port_label = QLabel("Serial Port:")
+        card_layout.addWidget(self.serial_port_label)
+        self.serial_port_dropdown = QComboBox()
+        card_layout.addWidget(self.serial_port_dropdown)
 
-        # Connect AFTER both widgets are created
-        self.nmea_enable_checkbox.toggled.connect(self.port_input.setEnabled)
+        # UDP port
+        self.udp_port_label = QLabel("UDP Port:")
+        card_layout.addWidget(self.udp_port_label)
+        self.udp_port_input = QLineEdit()
+        self.udp_port_input.setText("9999")
+        card_layout.addWidget(self.udp_port_input)
 
-        # Apply initial state (pass nmea_enabled into the constructor!)
-        self.nmea_enable_checkbox.setChecked(nmea_enabled)
-        self.port_input.setEnabled(nmea_enabled)
+        # Medium
+        card_layout.addWidget(QLabel("Medium:"))
+        self.medium_dropdown = QComboBox()
+        self.medium_dropdown.addItems(["water", "air"])
+        card_layout.addWidget(self.medium_dropdown)
 
-        # Add to card layout
-        card_layout.addLayout(nmea_section)
+        # Num samples
+        ns_row = QHBoxLayout()
+        ns_row.addWidget(QLabel("Num Samples:"))
+        self.num_samples_input = QLineEdit()
+        self.num_samples_input.setText("1800")
+        self.num_samples_input.setMaximumWidth(120)
+        ns_row.addWidget(self.num_samples_input)
+        ns_row.addStretch()
+        card_layout.addLayout(ns_row)
 
-        # --- Buttons ---
+        # === Depth Output ===
+        depth_header = QLabel("Depth Output")
+        depth_header.setStyleSheet("font-weight: bold; font-size: 15px;")
+        card_layout.addWidget(depth_header)
+
+        td_row = QHBoxLayout()
+        td_row.addWidget(QLabel("Transducer depth (m):"))
+        self.transducer_depth_input = QLineEdit("0.0")
+        self.transducer_depth_input.setMaximumWidth(80)
+        td_row.addWidget(self.transducer_depth_input)
+        td_row.addStretch()
+        card_layout.addLayout(td_row)
+
+        draft_row = QHBoxLayout()
+        draft_row.addWidget(QLabel("Draft (m):"))
+        self.draft_input = QLineEdit("0.0")
+        self.draft_input.setMaximumWidth(80)
+        draft_row.addWidget(self.draft_input)
+        draft_row.addStretch()
+        card_layout.addLayout(draft_row)
+
+        # SignalK
+        self.signalk_enable = QCheckBox("SignalK output")
+        card_layout.addWidget(self.signalk_enable)
+        sk_row = QHBoxLayout()
+        sk_row.addWidget(QLabel("SignalK address:"))
+        self.signalk_address_input = QLineEdit("localhost:3000")
+        sk_row.addWidget(self.signalk_address_input)
+        card_layout.addLayout(sk_row)
+
+        # NMEA
+        self.nmea_enable = QCheckBox("NMEA0183 output")
+        card_layout.addWidget(self.nmea_enable)
+        nmea_row = QHBoxLayout()
+        nmea_row.addWidget(QLabel("NMEA address:"))
+        self.nmea_address_input = QLineEdit("localhost:10110")
+        nmea_row.addWidget(self.nmea_address_input)
+        card_layout.addLayout(nmea_row)
+
+        # === Buttons ===
         button_layout = QHBoxLayout()
         apply_button = QPushButton("Apply")
-        apply_button.clicked.connect(self.apply_settings)
+        apply_button.clicked.connect(self._apply)
         cancel_button = QPushButton("Cancel")
-        cancel_button.clicked.connect(self.close)
+        cancel_button.clicked.connect(self.close)  # type: ignore[arg-type]
         button_layout.addWidget(apply_button)
         button_layout.addWidget(cancel_button)
         card_layout.addLayout(button_layout)
 
-        # Add card to outer layout
         outer_layout.addWidget(card)
 
-        # --- Styling ---
         self.setStyleSheet(
             """
-                QDialog {
-                    background-color: #1e1e1e;
-                }
-                QWidget#Card {
-                    background-color: #2b2b2b;
-                    border-radius: 12px;
-                    padding: 15px;
-                }
-                QLabel {
-                    color: #ffffff;
-                    font-size: 14px;
-                }
-                QComboBox {
-                    background-color: #3c3c3c;
-                    color: white;
-                    padding: 4px;
-                    border-radius: 4px;
-                }
-                QPushButton {
-                    background-color: #444444;
-                    border: 1px solid #666;
-                    padding: 5px 10px;
-                    border-radius: 6px;
-                }
-                QPushButton:hover {
-                    background-color: #555;
-                }
-            """
+            QWidget#Card {
+                background-color: #2b2b2b;
+                border-radius: 12px;
+                padding: 15px;
+            }
+            QLabel { color: #ffffff; font-size: 14px; }
+            QComboBox {
+                background-color: #3c3c3c; color: white;
+                padding: 4px; border-radius: 4px;
+            }
+            QLineEdit {
+                background-color: #3c3c3c; color: white;
+                padding: 4px; border-radius: 4px;
+            }
+            QPushButton {
+                background-color: #444444; border: 1px solid #666;
+                padding: 5px 10px; border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #555; }
+        """
         )
-
-        # Set object name so stylesheet applies to card
-        card.setObjectName("Card")
 
         self.setLayout(outer_layout)
-
-    def apply_settings(self):
-        selected_gradient = self.gradient_dropdown.currentText()
-        selected_speed = 343 if self.speed_dropdown.currentIndex() == 0 else 1440
-        nmea_enabled = self.nmea_enable_checkbox.isChecked()
-        nmea_port = (
-            int(self.port_input.text()) if self.port_input.text().isdigit() else 10110
+        self._on_connection_type_changed(
+            self.connection_type_dropdown.currentText()
         )
 
-        # Parse sampling params
-        try:
-            ns_value = int(self.num_samples_input.text())
-        except Exception:
-            ns_value = None
-        try:
-            st_us_value = float(self.sample_time_input.text())
-        except Exception:
-            st_us_value = None
+    # --- async population ---
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        asyncio.ensure_future(self._load_from_server())
+
+    async def _load_from_server(self):
+        """Fetch current settings + serial ports from web server."""
+        settings, ports = await asyncio.gather(
+            fetch_settings(self.server_url),
+            fetch_serial_ports(self.server_url),
+        )
+
+        if settings is None:
+            QMessageBox.warning(self, "Error", "Could not reach web server")
+            return
+
+        self._server_settings = settings
+
+        # Populate widgets from server state
+        ct = settings.get("connection_type")
+        if ct:
+            idx = self.connection_type_dropdown.findText(ct.upper())
+            if idx >= 0:
+                self.connection_type_dropdown.setCurrentIndex(idx)
+
+        self.serial_port_dropdown.clear()
+        self.serial_port_dropdown.addItems(ports)
+        sp = settings.get("serial_port", "")
+        idx = self.serial_port_dropdown.findText(sp)
+        if idx >= 0:
+            self.serial_port_dropdown.setCurrentIndex(idx)
+
+        self.udp_port_input.setText(str(settings.get("udp_port", 9999)))
+        self.num_samples_input.setText(str(settings.get("num_samples", 1800)))
+
+        medium = settings.get("medium", "water")
+        idx = self.medium_dropdown.findText(medium)
+        if idx >= 0:
+            self.medium_dropdown.setCurrentIndex(idx)
+
+        self.transducer_depth_input.setText(
+            str(settings.get("transducer_depth", 0.0))
+        )
+        self.draft_input.setText(str(settings.get("draft", 0.0)))
+
+        self.signalk_enable.setChecked(settings.get("signalk_enable", False))
+        self.signalk_address_input.setText(
+            settings.get("signalk_address", "localhost:3000")
+        )
+
+        self.nmea_enable.setChecked(settings.get("nmea_enable", False))
+        self.nmea_address_input.setText(
+            settings.get("nmea_address", "localhost:10110")
+        )
+
+    def _on_connection_type_changed(self, text):
+        is_serial = text.upper() == "SERIAL"
+        self.serial_port_label.setVisible(is_serial)
+        self.serial_port_dropdown.setVisible(is_serial)
+        self.udp_port_label.setVisible(not is_serial)
+        self.udp_port_input.setVisible(not is_serial)
+
+    # --- apply ---
+
+    def _apply(self):
+        # Local display settings — applied immediately
         if self.main_app:
-            self.main_app.set_gradient(selected_gradient)
-            self.main_app.set_sound_speed(selected_speed)
-            self.main_app.configure_nmea_output(enabled=nmea_enabled, port=nmea_port)
-            self.main_app.set_large_depth_display(self.large_depth_checkbox.isChecked())
-            # Apply sampling settings if valid
-            if ns_value and ns_value > 0:
-                self.main_app.set_num_samples(ns_value)
-            if st_us_value and st_us_value > 0:
-                # convert microseconds to seconds
-                self.main_app.set_sample_time(st_us_value * 1e-6)
+            self.main_app.set_gradient(self.gradient_dropdown.currentText())
+            self.main_app.set_large_depth_display(
+                self.large_depth_checkbox.isChecked()
+            )
 
-        self.close()
+        # Echo settings → push to server
+        echo_settings = dict(self._server_settings)
+        echo_settings["connection_type"] = (
+            self.connection_type_dropdown.currentText().upper()
+        )
+        echo_settings["serial_port"] = self.serial_port_dropdown.currentText()
+        try:
+            echo_settings["udp_port"] = int(self.udp_port_input.text())
+        except ValueError:
+            echo_settings["udp_port"] = 9999
+        try:
+            echo_settings["num_samples"] = int(self.num_samples_input.text())
+        except ValueError:
+            echo_settings["num_samples"] = 1800
+        echo_settings["medium"] = self.medium_dropdown.currentText()
+        try:
+            echo_settings["transducer_depth"] = float(
+                self.transducer_depth_input.text()
+            )
+        except ValueError:
+            echo_settings["transducer_depth"] = 0.0
+        try:
+            echo_settings["draft"] = float(self.draft_input.text())
+        except ValueError:
+            echo_settings["draft"] = 0.0
+        echo_settings["signalk_enable"] = self.signalk_enable.isChecked()
+        echo_settings["signalk_address"] = self.signalk_address_input.text()
+        echo_settings["nmea_enable"] = self.nmea_enable.isChecked()
+        echo_settings["nmea_address"] = self.nmea_address_input.text()
+
+        asyncio.ensure_future(self._push_and_close(echo_settings))
+
+    async def _push_and_close(self, echo_settings: dict):
+        result = await push_settings(self.server_url, echo_settings)
+        if result is None:
+            QMessageBox.warning(
+                self,
+                "Error",
+                "Failed to update settings on web server",
+            )
+        else:
+            self.settings_applied.emit()
+            self.close()
+
+
+# ---------------------------------------------------------------------------
+# Main application window
+# ---------------------------------------------------------------------------
 
 
 class WaterfallApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, server_url: str = DEFAULT_SERVER_URL):
         super().__init__()
-        self.serial_thread = None  # kept for backward-compat, no longer used
+        self.server_url = server_url
 
-        # Single async reader task (generic AsyncReader)
-        self._reader_task = None
-        self._reader_task_type: ConnectionTypeEnum | None = None
+        self.current_gradient = "cyclic"
+        self.large_depth_visible = True
 
-        self.nmea_enabled = False
-        self.nmea_port = 10110
-        self.nmea_socket = None
-        self.nmea_output_enabled = False
-
-        self.current_gradient = "cyclic"  # default color scheme
-        self.current_speed = SPEED_OF_SOUND  # default sound speed (343)
-
-        # User-configurable sampling parameters
-        self.num_samples = NUM_SAMPLES
-        self.sample_time = SAMPLE_TIME
+        # Sampling state — initialised from first WebSocket message
+        self.num_samples = 1800
+        self.resolution = 0.9768  # cm per row (water default)
 
         self.setWindowTitle("Open Echo Interface")
-        self.setGeometry(0, 0, 480, 800)  # Portrait mode for Raspberry Pi screen
+        self.setGeometry(0, 0, 480, 800)
 
         self._recompute_sampling_derived()
         self.data = np.zeros((MAX_ROWS, self.num_samples))
 
-        # Disable window translucency
-        self.setAttribute(Qt.WA_TranslucentBackground, False)
-
-        # Force opaque window flag
-        self.setWindowFlags(self.windowFlags() & ~Qt.FramelessWindowHint)
-
-        # Set solid background color explicitly via palette
+        # Solid background
+        self.setAttribute(Qt.WA_TranslucentBackground, False)  # type: ignore[attr-defined]
+        self.setWindowFlags(self.windowFlags() & ~Qt.FramelessWindowHint)  # type: ignore[attr-defined]
         palette = self.palette()
         palette.setColor(QPalette.Window, QColor("#2b2b2b"))
         self.setPalette(palette)
@@ -399,66 +611,37 @@ class WaterfallApp(QMainWindow):
         self.imageitem = pg.ImageItem(axisOrder="row-major")
         self.waterfall.addItem(self.imageitem)
         self.waterfall.setMouseEnabled(x=False, y=False)
-        self.waterfall.setMinimumHeight(400)  # Slightly more vertical space
+        self.waterfall.setMinimumHeight(400)
         self.waterfall.invertY(True)
 
         main_layout.addWidget(self.waterfall)
 
         inverted_depth_labels = list(self.depth_labels.items())[::-1]
         self.waterfall.getAxis("left").setTicks([inverted_depth_labels])
-        self.depth_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("r", width=2))
+        self.depth_line = pg.InfiniteLine(
+            angle=0, pen=pg.mkPen("r", width=2)
+        )
         self.waterfall.addItem(self.depth_line)
 
-        # Mirror Y-axis ticks to the right side
         right_axis = self.waterfall.getAxis("right")
         right_axis.setTicks([inverted_depth_labels])
         right_axis.setStyle(showValues=True)
 
-        # dd horizontal lines
-        self._depth_lines = []
-        for i in range(0, int(self.max_depth), Y_LABEL_DISTANCE):
-            row_index = int(i / self.sample_resolution)
-            hline = pg.InfiniteLine(
-                pos=row_index,
-                angle=0,
-                pen=pg.mkPen(color="w", style=pg.QtCore.Qt.DotLine),
-            )
-            self.waterfall.addItem(hline)
-            self._depth_lines.append(hline)
+        self._depth_lines: list[pg.InfiniteLine] = []
+        self._add_grid_lines()
 
-        # === Colorbar BELOW the plot to save width ===
+        # === Colorbar (hidden but still drives LUT) ===
         self.colorbar = pg.HistogramLUTWidget()
         self.colorbar.setImageItem(self.imageitem)
         self.colorbar.item.gradient.loadPreset("cyclic")
-        # self.colorbar.setMaximumHeight(80)
         self.imageitem.setLevels(DEFAULT_LEVELS)
 
-        # main_layout.addWidget(self.colorbar)
-
-        # === Controls (Vertical) ===
+        # === Controls ===
         controls_layout = QVBoxLayout()
 
-        # Serial row
-        serial_row = QHBoxLayout()
-
-        # === UDP Connection Row ===
-        udp_row = QHBoxLayout()
-
-        udp_row.addWidget(QLabel("UDP Port:"))
-        self.udp_port_input = QLineEdit()
-        self.udp_port_input.setText("5005")
-        self.udp_port_input.setMaximumWidth(100)
-        udp_row.addWidget(self.udp_port_input)
-
-        self.udp_connect_button = QPushButton("Connect UDP")
-        self.udp_connect_button.clicked.connect(self.toggle_udp_connection)
-        udp_row.addWidget(self.udp_connect_button)
-
-        controls_layout.addLayout(udp_row)
-
-        # === Large Depth Display ===
+        # Large Depth Display
         self.large_depth_label = QLabel("--- m")
-        self.large_depth_label.setAlignment(Qt.AlignCenter)
+        self.large_depth_label.setAlignment(Qt.AlignCenter)  # type: ignore[attr-defined]
         self.large_depth_label.setStyleSheet(
             """
             QLabel {
@@ -468,235 +651,130 @@ class WaterfallApp(QMainWindow):
             }
         """
         )
-        self.large_depth_label.setVisible(True)  # hidden by default
-        serial_row.addWidget(self.large_depth_label)
-
-        serial_row.addWidget(QLabel("Port:"))
-        self.serial_dropdown = QComboBox()
-        ports = get_serial_ports()
-        self.serial_dropdown.addItems(ports)
-        self.serial_dropdown.setMinimumWidth(150)
-        serial_row.addWidget(self.serial_dropdown)
-
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.clicked.connect(
-            self.toggle_serial_connection
-        )  # Connects to toggle handler
-        serial_row.addWidget(self.connect_button)
-
-        controls_layout.addLayout(serial_row)
+        self.large_depth_label.setVisible(True)
+        controls_layout.addWidget(self.large_depth_label)
 
         # Info labels
         info_layout = QHBoxLayout()
         self.depth_label = QLabel("Depth: --- cm")
         self.temperature_label = QLabel("Temperature: --- °C")
         self.drive_voltage_label = QLabel("vDRV: --- V")
-
         info_layout.addWidget(self.depth_label)
         info_layout.addWidget(self.temperature_label)
         info_layout.addWidget(self.drive_voltage_label)
-
         info_container = QWidget()
         info_container.setLayout(info_layout)
-        controls_layout.addWidget(info_container)  # No grid args!
+        controls_layout.addWidget(info_container)
 
-        # Hex input
-        hex_row = QHBoxLayout()
-        self.hex_input = QLineEdit()
-        self.hex_input.setPlaceholderText("0x1F")
-        hex_row.addWidget(self.hex_input)
+        # Bottom row: status + buttons
+        bottom_row = QHBoxLayout()
 
-        self.send_button = QPushButton("Send")
-        self.send_button.clicked.connect(self.send_hex_value)
-        hex_row.addWidget(self.send_button)
+        self.status_label = QLabel("Starting...")
+        self.status_label.setStyleSheet("color: #aaa; font-size: 12px;")
+        bottom_row.addWidget(self.status_label)
 
-        # Settings button
+        bottom_row.addStretch()
+
         self.settings_button = QPushButton("Settings")
         self.settings_button.clicked.connect(self.open_settings)
-        hex_row.addWidget(self.settings_button)
+        bottom_row.addWidget(self.settings_button)
 
-        # Quit button
+        self.web_button = QPushButton("Open Web UI")
+        self.web_button.clicked.connect(self._open_web_ui)
+        bottom_row.addWidget(self.web_button)
+
         self.quit_button = QPushButton("Quit")
-        self.quit_button.clicked.connect(self.close)
-        hex_row.addWidget(self.quit_button)
+        self.quit_button.clicked.connect(self.close)  # type: ignore[arg-type]
+        bottom_row.addWidget(self.quit_button)
 
-        controls_layout.addLayout(hex_row)
+        controls_layout.addLayout(bottom_row)
 
         controls_container = QWidget()
         controls_container.setLayout(controls_layout)
         main_layout.addWidget(controls_container)
 
-        # Adapter to safely update UI from async packets
+        # === WebSocket client ===
+        self._ws_client = WebSocketClient(server_url)
+        self._ws_client.packet_received.connect(self._on_ws_packet)
+        self._ws_client.connection_changed.connect(self._on_connection_changed)
 
-        class EchoAdapter(QObject):
-            packet_signal = pyqtSignal(object)
+        # === Web server manager ===
+        self._server_manager = WebServerManager(server_url)
 
-            def __init__(self, app_ref):
-                super().__init__()
-                self._app = app_ref
-                self.packet_signal.connect(self._on_packet)
+    # --- Lifecycle ---
 
-            def _on_packet(self, pkt):
-                try:
-                    # EchoPacket fields: spectrogram, depth_index, temperature, drive_voltage
-                    self._app.waterfall_plot_callback(
-                        pkt.samples,
-                        pkt.depth_index,
-                        pkt.temperature,
-                        pkt.drive_voltage,
-                    )
-                except Exception as e:
-                    print(f"UI packet handling error: {e}")
-
-            async def emit(self, pkt):
-                self.packet_signal.emit(pkt)
-
-        self._adapter = EchoAdapter(self)
-
-    def connect_udp(self):
-        try:
-            udp_port = int(self.udp_port_input.text())
-            settings = Settings(
-                connection_type=ConnectionTypeEnum.UDP,
-                udp_port=udp_port,
-                num_samples=self.num_samples,
+    async def start_connection(self):
+        """Ensure web server is running, then start WebSocket client."""
+        self._update_status("Starting server...")
+        ok = await self._server_manager.ensure_running()
+        if not ok:
+            self._update_status("Server failed to start")
+            QMessageBox.critical(
+                self,
+                "Error",
+                "Could not start or connect to the web server.\n"
+                "Try running 'openecho web' manually.",
             )
-            self._start_reader(settings)
-            self._reader_task_type = ConnectionTypeEnum.UDP
-            print(f"UDP listener started on port {udp_port}")
-        except Exception as e:
-            print(f"Failed to start UDP listener: {e}")
+            return
 
-    def disconnect_udp(self):
-        if self._reader_task and self._reader_task_type == ConnectionTypeEnum.UDP:
-            self._stop_reader()
-            self._reader_task_type = None
-            print("UDP listener stopped")
-        else:
-            print("No active UDP connection to disconnect")
+        # Check if this is the first run (no settings configured yet)
+        settings = await fetch_settings(self.server_url)
+        if settings and settings.get("serial_port") == "init":
+            self._update_status("Waiting for configuration...")
+            self.open_settings(on_first_run=True)
+            return
 
-    def toggle_udp_connection(self):
-        if self._reader_task and self._reader_task_type == ConnectionTypeEnum.UDP:
-            self.disconnect_udp()
-            self.udp_connect_button.setText("Connect UDP")
-        else:
-            self.connect_udp()
-            if self._reader_task and self._reader_task_type == ConnectionTypeEnum.UDP:
-                self.udp_connect_button.setText("Disconnect UDP")
+        self._ws_client.start()
 
-    def set_large_depth_display(self, enabled: bool):
-        self.large_depth_visible = enabled
-        self.large_depth_label.setVisible(enabled)
+    def closeEvent(self, event):
+        self._ws_client.stop()
+        self._server_manager.shutdown()
+        event.accept()
 
-    def configure_nmea_output(self, enabled: bool, port: int):
-        self.nmea_output_enabled = enabled
-        self.nmea_port = port
-
-        self.nmea_server_socket: socket.socket | None
-        self.nmea_client_socket: socket.socket | None
-
-        # Close previous connections if needed
-        if hasattr(self, "nmea_client_socket") and self.nmea_client_socket:
-            try:
-                self.nmea_client_socket.close()
-            except Exception:
-                pass
-            self.nmea_client_socket = None
-
-        if hasattr(self, "nmea_server_socket") and self.nmea_server_socket:
-            try:
-                self.nmea_server_socket.close()
-            except Exception:
-                pass
-            self.nmea_server_socket = None
-
-        if enabled:
-            try:
-                self.nmea_server_socket = socket.socket(
-                    socket.AF_INET, socket.SOCK_STREAM
-                )
-                self.nmea_server_socket.setsockopt(
-                    socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
-                )
-                self.nmea_server_socket.bind(("0.0.0.0", port))
-                self.nmea_server_socket.listen(1)
-                print(f"Waiting for TCP NMEA connection on port {port}...")
-                self.nmea_client_socket, _ = self.nmea_server_socket.accept()
-                print(f"NMEA client connected on port {port}")
-            except Exception as e:
-                print(f"Failed to set up NMEA output: {e}")
-                self.nmea_output_enabled = False
-
-    def generate_dbt_sentence(self, depth_cm):
-        depth_m = depth_cm / 100.0
-        depth_ft = depth_m * 3.28084
-        depth_fathoms = depth_m * 0.546807
-
-        sentence_body = f"DBT,{depth_ft:.1f},f,{depth_m:.1f},M,{depth_fathoms:.1f},F"
-        checksum = 0
-        for char in sentence_body:
-            checksum ^= ord(char)
-
-        return f"${sentence_body}*{checksum:02X}\r\n"
-
-    def set_gradient(self, gradient_name):
-        self.current_gradient = gradient_name
-        self.colorbar.item.gradient.loadPreset(gradient_name)
-
-    def set_sound_speed(self, speed):
-        global SPEED_OF_SOUND
-        SPEED_OF_SOUND = speed
-        self.current_speed = speed
-        self._recompute_sampling_derived()
-        self._refresh_axes_and_grid()
-
-    def key_press_event(self, event):
-        print("key pressed")
+    def keyPressEvent(self, event):
         if event.key() == ord("Q"):
-            print("Quit triggered from keyboard.")
             self.close()
-        elif event.key() == ord("C"):
-            print("Connect triggered from keyboard.")
-            self.connect_button.click()
         else:
             super().keyPressEvent(event)
 
-    def connect_serial(self):
-        selected_port = self.serial_dropdown.currentText()
-        try:
-            settings = Settings(
-                connection_type=ConnectionTypeEnum.SERIAL,
-                serial_port=selected_port,
-                num_samples=self.num_samples,
-            )
-            self._start_reader(settings)
-            self._reader_task_type = ConnectionTypeEnum.SERIAL
-            print(f"Connected to {selected_port}")
-        except Exception as e:
-            print(f"Connection failed: {e}")
+    # --- WebSocket data handling ---
 
-    def toggle_serial_connection(self):
-        if self._reader_task and self._reader_task_type == ConnectionTypeEnum.SERIAL:
-            self.disconnect_serial()
-            self.connect_button.setText("Connect")
-        else:
-            self.connect_serial()
-            if (
-                self._reader_task
-                and self._reader_task_type == ConnectionTypeEnum.SERIAL
-            ):
-                self.connect_button.setText("Disconnect")
+    def _on_ws_packet(self, data: dict):
+        spectrogram = data.get("spectrogram")
+        if spectrogram is None:
+            return
 
-    def disconnect_serial(self):
-        if self._reader_task and self._reader_task_type == ConnectionTypeEnum.SERIAL:
-            self._stop_reader()
-            self._reader_task_type = None
-            print("Disconnected from serial device")
-        else:
-            print("No active serial connection to disconnect")
+        spectrogram = np.array(spectrogram, dtype=np.uint8)
 
-    def waterfall_plot_callback(
-        self, spectrogram, depth_index, temperature, drive_voltage
+        # Dynamic num_samples handling
+        if len(spectrogram) != self.num_samples:
+            self.num_samples = len(spectrogram)
+            self.data = np.zeros((MAX_ROWS, self.num_samples))
+            self._recompute_sampling_derived()
+            self._refresh_axes_and_grid()
+
+        # Update resolution if it changed
+        new_resolution = data.get("resolution", self.resolution)
+        if abs(new_resolution - self.resolution) > 0.001:
+            self.resolution = new_resolution
+            self._recompute_sampling_derived()
+            self._refresh_axes_and_grid()
+
+        depth_m = data.get("measured_depth", 0.0)
+        temperature = data.get("temperature", 0.0)
+        drive_voltage = data.get("drive_voltage", 0.0)
+
+        # Convert depth_m back to index for the depth line position
+        depth_index = (
+            depth_m / (self.resolution / 100) if self.resolution > 0 else 0
+        )
+
+        self._waterfall_plot_callback(
+            spectrogram, depth_index, depth_m, temperature, drive_voltage
+        )
+
+    def _waterfall_plot_callback(
+        self, spectrogram, depth_index, depth_m, temperature, drive_voltage
     ):
         self.data = np.roll(self.data, -1, axis=0)
         self.data[-1, :] = spectrogram
@@ -706,123 +784,65 @@ class WaterfallApp(QMainWindow):
         mean = np.mean(self.data)
         self.imageitem.setLevels((mean - 2 * sigma, mean + 2 * sigma))
 
-        depth_cm = depth_index * self.sample_resolution
-        self.depth_label.setText(f"Depth: {depth_cm:.1f} cm | Index: {depth_index:.0f}")
+        depth_cm = depth_m * 100
+        self.depth_label.setText(
+            f"Depth: {depth_cm:.1f} cm | Index: {depth_index:.0f}"
+        )
         self.temperature_label.setText(f"Temperature: {temperature:.1f} °C")
         self.drive_voltage_label.setText(f"vDRV: {drive_voltage:.1f} V")
         self.depth_line.setPos(depth_index)
 
-        # Update big depth label (in meters, 1 decimal)
         if self.large_depth_label.isVisible():
-            self.large_depth_label.setText(f"{depth_cm / 100:.1f} m")
+            self.large_depth_label.setText(f"{depth_m:.1f} m")
 
-        if hasattr(self, "nmea_output_enabled") and self.nmea_output_enabled:
-            now = time.time()
+    # --- Connection status ---
 
-            # Check if it's time to send again
-            if (
-                not hasattr(self, "_last_nmea_sent")
-                or (now - self._last_nmea_sent) >= 1.0
-            ):
-                print("Sending NMEA data")
-                try:
-                    depth_cm = depth_index * self.sample_resolution
-                    depth_m = depth_cm / 100
-                    depth_ft = depth_m * 3.28084
-                    depth_fathoms = depth_m * 0.546807
+    def _on_connection_changed(self, status: str):
+        status_map = {
+            "connected": "Server: connected",
+            "reconnecting": "Server: reconnecting...",
+            "starting": "Server: starting...",
+        }
+        self._update_status(status_map.get(status, status))
 
-                    def calculate_checksum(sentence):
-                        checksum = 0
-                        for char in sentence:
-                            checksum ^= ord(char)
-                        return f"*{checksum:02X}"
+    def _update_status(self, text: str):
+        self.status_label.setText(text)
 
-                    nmea_sentence = (
-                        f"DBT,{depth_ft:.1f},f,{depth_m:.1f},M,{depth_fathoms:.1f},F"
-                    )
-                    full_sentence = (
-                        f"${nmea_sentence}{calculate_checksum(nmea_sentence)}\r\n"
-                    )
+    # --- Display settings ---
 
-                    self.nmea_client_socket.sendall(full_sentence.encode("ascii"))
+    def set_gradient(self, gradient_name):
+        self.current_gradient = gradient_name
+        self.colorbar.item.gradient.loadPreset(gradient_name)
 
-                    # Update timestamp
-                    self._last_nmea_sent = now
+    def set_large_depth_display(self, enabled: bool):
+        self.large_depth_visible = enabled
+        self.large_depth_label.setVisible(enabled)
 
-                except Exception as e:
-                    print(f"NMEA send failed: {e}")
+    # --- Settings dialog ---
 
-    def send_hex_value(self):
-        hex_value = self.hex_input.text().strip()
-        print(hex_value)
-
-        if hex_value.startswith("0x") and len(hex_value) > 2:
-            try:
-                if self.serial_thread and self.serial_thread.isRunning():
-                    with serial.Serial(
-                        self.serial_dropdown.currentText(), BAUD_RATE
-                    ) as ser:
-                        ser.write(hex_value.encode())
-                        print(f"Sent: {hex_value}")
-            except ValueError:
-                print("Invalid hex format.")
-        else:
-            print("Invalid hex value. Please enter a valid hex string (e.g., 0x1F)")
-
-    def close_event(self, event):
-        # Cancel async reader task
-        if self._reader_task:
-            try:
-                self._reader_task.cancel()
-            except Exception:
-                pass
-            self._reader_task = None
-        event.accept()
-
-    def _start_reader(self, settings: Settings):
-        # Generic starter for any AsyncReader subclass
-        if self._reader_task:
-            self._stop_reader()
-
-        async def _run():
-            reader_cls = settings.connection_type.value
-            print(f"Starting {reader_cls.__name__}")
-            try:
-                reader = reader_cls(settings)
-                async with reader:
-                    async for pkt in reader:
-                        await self._adapter.emit(pkt)
-            except Exception as e:
-                print(f"Reader error: {e}")
-
-        self._reader_task = asyncio.create_task(_run())
-
-    def _stop_reader(self):
-        if self._reader_task:
-            try:
-                self._reader_task.cancel()
-            except Exception:
-                pass
-            self._reader_task = None
-
-    def open_settings(self):
-        device_ip = get_local_ip()
-
+    def open_settings(self, on_first_run=False):
         self.settings_dialog = SettingsDialog(
             parent=self,
             current_gradient=self.current_gradient,
-            current_speed=self.current_speed,
-            current_num_samples=self.num_samples,
-            current_sample_time_us=self.sample_time * 1e6,
-            nmea_enabled=self.nmea_output_enabled,
-            nmea_port=self.nmea_port,
-            nmea_address=device_ip,
+            server_url=self.server_url,
         )
+        if on_first_run:
+            # Start the WebSocket client once the user applies settings
+            self.settings_dialog.settings_applied.connect(self._ws_client.start)
         self.settings_dialog.show()
 
+    def _open_web_ui(self):
+        from PyQt5.QtCore import QUrl
+        from PyQt5.QtGui import QDesktopServices
+
+        QDesktopServices.openUrl(QUrl(self.server_url))
+
+    # --- Sampling / axes ---
+
     def _recompute_sampling_derived(self):
-        # Derived values based on current sampling configuration and speed of sound
-        self.sample_resolution = (SPEED_OF_SOUND * self.sample_time * 100) / 2
+        self.sample_resolution = self.resolution  # cm per row
+        if self.sample_resolution <= 0:
+            self.sample_resolution = 0.9768  # safe fallback
         self.max_depth = int(self.num_samples * self.sample_resolution)
         self.depth_labels = {
             int(i / self.sample_resolution): f"{i / 100}"
@@ -833,17 +853,10 @@ class WaterfallApp(QMainWindow):
         inverted_depth_labels = list(self.depth_labels.items())[::-1]
         self.waterfall.getAxis("left").setTicks([inverted_depth_labels])
         self.waterfall.getAxis("right").setTicks([inverted_depth_labels])
+        self._remove_grid_lines()
+        self._add_grid_lines()
 
-        # Remove old grid lines
-        if hasattr(self, "_depth_lines"):
-            for ln in self._depth_lines:
-                try:
-                    self.waterfall.removeItem(ln)
-                except Exception:
-                    pass
-        self._depth_lines = []
-
-        # Add new grid lines
+    def _add_grid_lines(self):
         for i in range(0, int(self.max_depth), Y_LABEL_DISTANCE):
             row_index = int(i / self.sample_resolution)
             hline = pg.InfiniteLine(
@@ -854,61 +867,32 @@ class WaterfallApp(QMainWindow):
             self.waterfall.addItem(hline)
             self._depth_lines.append(hline)
 
-    def set_num_samples(self, n: int):
-        try:
-            n = int(n)
-        except Exception:
-            return
-        if n <= 0:
-            return
-        if n == self.num_samples:
-            return
-        self.num_samples = n
-        # Resize data buffer
-        self.data = np.zeros((MAX_ROWS, self.num_samples))
-        self._recompute_sampling_derived()
-        self._refresh_axes_and_grid()
-
-    def set_sample_time(self, seconds: float):
-        try:
-            seconds = float(seconds)
-        except Exception:
-            return
-        if seconds <= 0:
-            return
-        if abs(seconds - self.sample_time) < 1e-12:
-            return
-        self.sample_time = seconds
-        self._recompute_sampling_derived()
-        self._refresh_axes_and_grid()
+    def _remove_grid_lines(self):
+        for ln in self._depth_lines:
+            try:
+                self.waterfall.removeItem(ln)
+            except Exception:
+                pass
+        self._depth_lines.clear()
 
 
-def set_gradient(self, gradient_name):
-    try:
-        self.current_gradient = gradient_name
-        self.colorbar.item.gradient.loadPreset(gradient_name)
-        print(f"Gradient changed to: {gradient_name}")
-    except Exception as e:
-        print(f"Failed to apply gradient '{gradient_name}': {e}")
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 
-def get_current_gradient(self):
-    try:
-        return self.colorbar.item.gradient.currentPreset
-    except Exception:
-        return "cyclic"  # Fallback
-
-
-def run_desktop():
+def run_desktop(server_url: str = DEFAULT_SERVER_URL):
     app = QApplication(sys.argv)
     qdarktheme.setup_theme("dark")
 
-    # Run Qt and asyncio together
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    window = WaterfallApp()
+    window = WaterfallApp(server_url=server_url)
     window.show()
+
+    # Kick off the async server check + WebSocket connection
+    asyncio.ensure_future(window.start_connection())
 
     with loop:
         loop.run_forever()

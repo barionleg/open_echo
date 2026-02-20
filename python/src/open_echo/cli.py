@@ -12,7 +12,14 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     desktop_parser = subparsers.add_parser("desktop", help="Run desktop interface")
-    desktop_parser.set_defaults(handler=lambda _: run_desktop())
+    desktop_parser.add_argument(
+        "--server-url",
+        default="http://localhost:8000",
+        help="URL of the web server (default: http://localhost:8000)",
+    )
+    desktop_parser.set_defaults(
+        handler=lambda args: run_desktop(server_url=args.server_url)
+    )
 
     web_parser = subparsers.add_parser("web", help="Run web interface")
     web_parser.set_defaults(handler=lambda _: run_web())

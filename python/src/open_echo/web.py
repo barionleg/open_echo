@@ -199,6 +199,25 @@ async def config_post(request: Request, new_settings: Settings = Form(...)):  # 
     return RedirectResponse("/", status_code=303)
 
 
+# --- JSON API for desktop client ---
+
+
+@app.get("/api/settings")
+async def api_get_settings():
+    return app.state.settings.model_dump()
+
+
+@app.put("/api/settings")
+async def api_put_settings(new_settings: Settings):
+    await update_settings(new_settings)
+    return app.state.settings.model_dump()
+
+
+@app.get("/api/serial-ports")
+async def api_serial_ports():
+    return SerialReader.get_serial_ports()
+
+
 def run_web():
     import uvicorn
 
