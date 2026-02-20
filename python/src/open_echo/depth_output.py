@@ -1,11 +1,14 @@
 import asyncio
 import json
+import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
 import websockets
 from httpx import AsyncClient
 from open_echo.settings import NMEAOffset, Settings
+
+logger = logging.getLogger(__name__)
 
 
 class OutputManager:
@@ -32,14 +35,14 @@ class OutputManager:
             if method in output_methods
         ]
         self._output_classes = [cls(self.settings) for cls in new_output_classes]
-        print(f"Output classes: {self._output_classes}")
+        logger.info("Output classes: %s", self._output_classes)
 
         for output_class in self._output_classes:
             await output_class.start()
 
     async def output(self) -> Any:
         for output_class in self._output_classes:
-            if output_class.current_value is not None or (
+            if output_class.current_value is not None and (
                 output_class.last_output_time is None
                 or (
                     (asyncio.get_event_loop().time() - output_class.last_output_time)
@@ -132,7 +135,7 @@ class SignalKOutput(OutputMethod):
                     access_request_uri,
                     json={
                         "clientId": "f6b20288-5ecf-4daa-9a13-1594bc145abe",
-                        "description": "open_echo Depth Sounder",
+                        "description": "Open Echo Depth Sounder",
                     },
                 )
                 access_request.raise_for_status()
@@ -173,10 +176,10 @@ class SignalKOutput(OutputMethod):
     async def output(self):
         if self._ws is None:
             try:
-                print("Reconnecting to SignalK server...")
+                logger.info("Reconnecting to SignalK server...")
                 await self.start()
             except Exception as e:
-                print(f"SignalK connection error: {e}")
+                logger.exception("SignalK connection error: %s", e)
                 return
         try:
             # Format as SignalK delta message for depth
@@ -208,10 +211,10 @@ class SignalKOutput(OutputMethod):
 
             delta = {"updates": [{"values": values}]}
 
-            print("Send signalk delta: %s", delta)
+            logger.debug("Send signalk delta: %s", delta)
             await self._ws.send(json.dumps(delta))
         except Exception as e:
-            print(f"SignalK send error: {e}")
+            logger.exception("SignalK send error: %s", e)
             # Attempt reconnect next time
             if self._ws:
                 await self.stop()
@@ -249,7 +252,7 @@ class NMEA0183Output(OutputMethod):
             try:
                 await self.start()
             except Exception as e:
-                print(f"NMEA0183 TCP connection error: {e}")
+                logger.exception("NMEA0183 TCP connection error: %s", e)
                 return
         try:
             # Send DBT and DPT sentences, ending with CRLF (NMEA standard)
@@ -291,7 +294,7 @@ class NMEA0183Output(OutputMethod):
 
             await self._writer.drain()
         except Exception as e:
-            print(f"NMEA0183 TCP send error: {e}")
+            logger.exception("NMEA0183 TCP send error: %s", e)
             # Attempt reconnect next time
             await self.stop()
 

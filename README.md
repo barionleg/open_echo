@@ -32,7 +32,7 @@ Raw Data Waterfall chart in the Python Desktop software:
 
 If you need the hardware, you can order it using the [Hardware Files](https://github.com/neumi/open_echo/tree/main/TUSS4470_shield_002/TUSS4470_shield_hardware/TUSS4470_shield) from a board + SMT house ([JLC recommended](https://jlcpcb.com/?from=Neumi)).
 
-They can also be bought as a complete and tested set direclty from Elecrow: https://www.elecrow.com/open-echo-tuss4470-development-shield.html
+They can also be bought as a complete and tested set directly from Elecrow: https://www.elecrow.com/open-echo-tuss4470-development-shield.html
 
 If they’re out of stock, or if you’d prefer to order them within Germany to reduce shipping costs, please send me an email at: openechoes@gmail.com
 
