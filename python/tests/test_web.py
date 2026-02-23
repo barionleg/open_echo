@@ -1,4 +1,5 @@
 """Tests for the web server FastAPI endpoints."""
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,9 +22,7 @@ def client():
         patch.object(echo_reader, "__exit__", return_value=False),
         patch.object(output_manager, "__enter__", return_value=output_manager),
         patch.object(output_manager, "__exit__", return_value=False),
-        patch.object(
-            output_manager, "update_settings", new_callable=AsyncMock
-        ),
+        patch.object(output_manager, "update_settings", new_callable=AsyncMock),
         patch.object(echo_reader, "update_settings"),
         patch("open_echo.web.Settings.load", return_value=Settings()),
         patch("open_echo.web.Settings.save"),
@@ -86,9 +85,7 @@ class TestApiPutSettings:
 
     def test_merges_with_existing_settings(self, client):
         # Set initial state
-        app.state.settings = Settings(
-            serial_port="/dev/ttyUSB0", num_samples=1000
-        )
+        app.state.settings = Settings(serial_port="/dev/ttyUSB0", num_samples=1000)
         # PUT only changes num_samples
         resp = client.put(
             "/api/settings",

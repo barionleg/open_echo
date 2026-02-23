@@ -59,6 +59,7 @@ class OutputManager:
                 continue
 
             await self.output()
+            await asyncio.sleep(0.1)
 
     def __enter__(self):
         self._task = asyncio.create_task(self._run())

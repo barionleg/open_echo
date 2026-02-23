@@ -61,7 +61,9 @@ class EchoPacket:
         # Verify checksum
         calc = compute_checksum(payload)
         if calc != checksum[0]:
-            log.warning("Checksum mismatch: expected 0x%02X, got 0x%02X", checksum[0], calc)
+            log.warning(
+                "Checksum mismatch: expected 0x%02X, got 0x%02X", checksum[0], calc
+            )
             raise ChecksumMismatchError("Checksum mismatch")
 
         # Unpack payload
@@ -118,8 +120,25 @@ class SerialReader(AsyncReader):
 
     @staticmethod
     def get_serial_ports() -> list[str]:
-        """Retrieve a list of available serial ports."""
-        return [port.device for port in serial.tools.list_ports.comports()][::-1]
+        """Retrieve a list of available serial ports.
+
+        Also includes the simulated PTY device if the simulator is running.
+        """
+        import os
+
+        ports = [port.device for port in serial.tools.list_ports.comports()][::-1]
+
+        # Check for a running simulator PTY
+        pty_marker = os.path.join(os.path.expanduser("~"), ".openecho_simulate_pty")
+        try:
+            with open(pty_marker) as f:
+                pty_path = f.read().strip()
+            if pty_path and os.path.exists(pty_path) and pty_path not in ports:
+                ports.insert(0, pty_path)
+        except FileNotFoundError:
+            pass
+
+        return ports
 
     async def open(self):
         self.reader, self.writer = await aserial.open_serial_connection(

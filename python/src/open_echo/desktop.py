@@ -57,9 +57,7 @@ class WebSocketClient(QObject):
         super().__init__()
         self.server_url = server_url.rstrip("/")
         self._ws_url = (
-            self.server_url.replace("http://", "ws://").replace(
-                "https://", "wss://"
-            )
+            self.server_url.replace("http://", "ws://").replace("https://", "wss://")
             + "/ws"
         )
         self._thread: threading.Thread | None = None
@@ -108,9 +106,7 @@ class WebSocketClient(QObject):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.warning(
-                    "WebSocket error: %s — retrying in %.0fs", e, retry_delay
-                )
+                log.warning("WebSocket error: %s — retrying in %.0fs", e, retry_delay)
                 self.connection_changed.emit("reconnecting")
                 # Use stop_event.wait so we can exit promptly
                 if self._stop_event.wait(timeout=retry_delay):
@@ -133,9 +129,7 @@ class WebServerManager:
 
     async def ensure_running(self) -> bool:
         """Return True once the server is reachable. Spawns if needed."""
-        if await asyncio.get_event_loop().run_in_executor(
-            None, self._is_reachable
-        ):
+        if await asyncio.get_event_loop().run_in_executor(None, self._is_reachable):
             log.info("Web server already running at %s", self.server_url)
             return True
 
@@ -144,9 +138,7 @@ class WebServerManager:
         # Wait for it to become reachable
         for _ in range(60):  # up to ~30 s
             await asyncio.sleep(0.5)
-            if await asyncio.get_event_loop().run_in_executor(
-                None, self._is_reachable
-            ):
+            if await asyncio.get_event_loop().run_in_executor(None, self._is_reachable):
                 log.info("Web server is now reachable")
                 return True
 
@@ -157,9 +149,7 @@ class WebServerManager:
         import urllib.request
 
         try:
-            resp = urllib.request.urlopen(
-                f"{self.server_url}/api/settings", timeout=2
-            )
+            resp = urllib.request.urlopen(f"{self.server_url}/api/settings", timeout=2)
             return resp.status == 200
         except Exception:
             return False
@@ -203,9 +193,7 @@ def _fetch_settings_sync(server_url: str) -> dict | None:
     import urllib.request
 
     try:
-        resp = urllib.request.urlopen(
-            f"{server_url}/api/settings", timeout=5
-        )
+        resp = urllib.request.urlopen(f"{server_url}/api/settings", timeout=5)
         return json.loads(resp.read())
     except Exception as e:
         log.error("Failed to fetch settings: %s", e)
@@ -236,9 +224,7 @@ def _fetch_serial_ports_sync(server_url: str) -> list[str]:
     import urllib.request
 
     try:
-        resp = urllib.request.urlopen(
-            f"{server_url}/api/serial-ports", timeout=5
-        )
+        resp = urllib.request.urlopen(f"{server_url}/api/serial-ports", timeout=5)
         return json.loads(resp.read())
     except Exception as e:
         log.error("Failed to fetch serial ports: %s", e)
@@ -446,9 +432,7 @@ class SettingsDialog(QWidget):
         )
 
         self.setLayout(outer_layout)
-        self._on_connection_type_changed(
-            self.connection_type_dropdown.currentText()
-        )
+        self._on_connection_type_changed(self.connection_type_dropdown.currentText())
 
     # --- async population ---
 
@@ -491,9 +475,7 @@ class SettingsDialog(QWidget):
         if idx >= 0:
             self.medium_dropdown.setCurrentIndex(idx)
 
-        self.transducer_depth_input.setText(
-            str(settings.get("transducer_depth", 0.0))
-        )
+        self.transducer_depth_input.setText(str(settings.get("transducer_depth", 0.0)))
         self.draft_input.setText(str(settings.get("draft", 0.0)))
 
         self.signalk_enable.setChecked(settings.get("signalk_enable", False))
@@ -502,9 +484,7 @@ class SettingsDialog(QWidget):
         )
 
         self.nmea_enable.setChecked(settings.get("nmea_enable", False))
-        self.nmea_address_input.setText(
-            settings.get("nmea_address", "localhost:10110")
-        )
+        self.nmea_address_input.setText(settings.get("nmea_address", "localhost:10110"))
 
     def _on_connection_type_changed(self, text):
         is_serial = text.upper() == "SERIAL"
@@ -519,9 +499,7 @@ class SettingsDialog(QWidget):
         # Local display settings — applied immediately
         if self.main_app:
             self.main_app.set_gradient(self.gradient_dropdown.currentText())
-            self.main_app.set_large_depth_display(
-                self.large_depth_checkbox.isChecked()
-            )
+            self.main_app.set_large_depth_display(self.large_depth_checkbox.isChecked())
 
         # Echo settings → push to server
         echo_settings = dict(self._server_settings)
@@ -618,9 +596,7 @@ class WaterfallApp(QMainWindow):
 
         inverted_depth_labels = list(self.depth_labels.items())[::-1]
         self.waterfall.getAxis("left").setTicks([inverted_depth_labels])
-        self.depth_line = pg.InfiniteLine(
-            angle=0, pen=pg.mkPen("r", width=2)
-        )
+        self.depth_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("r", width=2))
         self.waterfall.addItem(self.depth_line)
 
         right_axis = self.waterfall.getAxis("right")
@@ -765,9 +741,7 @@ class WaterfallApp(QMainWindow):
         drive_voltage = data.get("drive_voltage", 0.0)
 
         # Convert depth_m back to index for the depth line position
-        depth_index = (
-            depth_m / (self.resolution / 100) if self.resolution > 0 else 0
-        )
+        depth_index = depth_m / (self.resolution / 100) if self.resolution > 0 else 0
 
         self._waterfall_plot_callback(
             spectrogram, depth_index, depth_m, temperature, drive_voltage
@@ -785,9 +759,7 @@ class WaterfallApp(QMainWindow):
         self.imageitem.setLevels((mean - 2 * sigma, mean + 2 * sigma))
 
         depth_cm = depth_m * 100
-        self.depth_label.setText(
-            f"Depth: {depth_cm:.1f} cm | Index: {depth_index:.0f}"
-        )
+        self.depth_label.setText(f"Depth: {depth_cm:.1f} cm | Index: {depth_index:.0f}")
         self.temperature_label.setText(f"Temperature: {temperature:.1f} °C")
         self.drive_voltage_label.setText(f"vDRV: {drive_voltage:.1f} V")
         self.depth_line.setPos(depth_index)

@@ -8,19 +8,22 @@ from open_echo.echo import START_BYTE, compute_checksum, payload_size
 
 def configure_relay_parser(parser):
     parser.add_argument(
-        "-p", "--uart-port",
+        "-p",
+        "--uart-port",
         help="UART device (e.g. COM3 or /dev/ttyUSB0)",
     )
 
     parser.add_argument(
-        "-b", "--baud-rate",
+        "-b",
+        "--baud-rate",
         type=int,
         default=250000,
         help="UART baud rate (default: 250000)",
     )
 
     parser.add_argument(
-        "-n", "--samples",
+        "-n",
+        "--samples",
         type=int,
         default=1800,
         help="Number of samples per packet (default: 1800)",
@@ -156,9 +159,7 @@ def run_relay(args=None):
 
             while True:
                 packet = read_raw_packet(
-                    ser,
-                    pld_size,
-                    verbose=args.verbose and not args.quiet
+                    ser, pld_size, verbose=args.verbose and not args.quiet
                 )
                 udp_sock.sendto(packet, (udp_ip, args.udp_port))
 
