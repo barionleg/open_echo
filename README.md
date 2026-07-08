@@ -34,14 +34,14 @@ All profits go directly toward supporting and advancing the Open Echo project!
 <b>If you don't order the boards directly from me or Elecrow, please be aware that I can't provide support.</b>
 
 [TUSS4470 Arduino Shield](https://github.com/barionleg/open_echo/TUSS4470_shield_002/):  
-<img alt="PCB overview TUSS4470" src="[/](https://barionleg.github.io/open_echo/)documentation/images/TUSS4470_shield002.jpg">
+<img alt="PCB overview TUSS4470" src="https://barionleg.github.io/open_echo/documentation/images/TUSS4470_shield002.jpg">
 
 ### This project is currently in development. The [TUSS4470 Development Shield](TUSS4470_shield_002/) is ready for external use!  
 Development is ongoing! Check the documentation and Discord channel for the latest updates.  
 
 Want to stay updated or participate? Join the [Discord](https://discord.com/invite/rerCyqAcrw)!  
 
-Check the [Getting Started Guide](TUSS4470_shield_002/README.md).  
+Check the [Getting Started Guide](https://github.com/barionleg/open_echo/TUSS4470_shield_002/README.md).  
 
 ## Vision
 An accessible Open Source SONAR stack for development, research and real use:
@@ -65,21 +65,21 @@ An accessible Open Source SONAR stack for development, research and real use:
 --------
 ## Progress
 
-The new (May 2025) [TUSS4470 Arduino Shield](TUSS4470_shield_002/) supports transducers from 40 kHz to 1000 kHz. It can drive them, receive echoes, filter signals, and send raw echo data to the Python backend.  
+The new (May 2025) [TUSS4470 Arduino Shield](https://github.com/barionleg/open_echo/TUSS4470_shield_002/) supports transducers from 40 kHz to 1000 kHz. It can drive them, receive echoes, filter signals, and send raw echo data to the Python backend.  
 Driver voltage can be supplied from Arduino VIN or via the external XT30 connector. With an MT3608 boost converter, USB can be used as a power supply and boosted to the desired drive voltage (manual soldering required).  
 
-The [TUSS4470 Arduino Shield](TUSS4470_shield_002/) is and will remain the main development board for this project. It is an excellent platform for testing and development.  
+The [TUSS4470 Arduino Shield](https://github.com/barionleg/open_echo/TUSS4470_shield_002/) is and will remain the main development board for this project. It is an excellent platform for testing and development.  
 It can drive a wide range of transducers at different voltages, but it is limited by RAM size and sampling speed. You can capture 1800 samples at 12 microseconds per sample (~18 m range in water) with 8-bit resolution. For longer ranges, you can add a delay to capture echoes from more distant objects.  
 This makes it a perfect board for learning, testing, and prototyping. Most software development is done using this board.  
 
 For special use cases, additional boards and software are under development. 
-Check the [development](development) folder for development work.
+Check the [development](https://github.com/barionleg/open_echo/development) folder for development work.
 
 --------
 ## Open Echo Interface Software
 
 Firmware examples are available in each project folder.  
-The [**Open Echo Interface Software**](TUSS4470_shield_002/echo_interface.py) allows you to control Open Echo boards, view live data, and adjust board settings.  
+The [**Open Echo Interface Software**](https://github.com/barionleg/open_echo/TUSS4470_shield_002/echo_interface.py) allows you to control Open Echo boards, view live data, and adjust board settings.  
 
 Live echogram in water on Python software (6x speed):  
 <img alt="Software running with live echo data" src="https://barionleg.github.io/open_echo/documentation/images/echogram_fast.gif">
