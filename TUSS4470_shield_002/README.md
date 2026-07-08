@@ -15,13 +15,13 @@ Use the Python software to see the echoes.
 ### Ordering
 The shield can be easily ordered via [JLCPCB](https://jlcpcb.com/?from=Neumi) or other PCB fabrication services.
 
-<img alt="TUSS4470 schematic" src="/documentation/images/starter_kit.jpg">
+<img alt="TUSS4470 schematic" src="https://barionleg.github.io/open_echo/documentation/images/starter_kit.jpg">
 
 > [!Note]
 > I just got a few new boards, I sell as starter kits. Feel free to DM me on [Discord](https://discord.com/invite/rerCyqAcrw) if you're interested. Or send an email to: openechoes@gmail.com One assmebled board is 50€ + shipping. (10/2025)
 
 
-<img alt="PCB overview TUSS4470" src="/documentation/images/shield_pinout.png">
+<img alt="PCB overview TUSS4470" src="https://barionleg.github.io/open_echo//documentation/images/shield_pinout.png">
 
 
 ## Electrical Connections
@@ -50,7 +50,7 @@ If you need to drive transducers at frequencies other than the provided presets 
 > On board version 002, "Custom" is pre-selected to match the right capacitances <b/>together</b> with the 200kHz capacitors for 150kHz. 
 
 Below is the electrical connection layout for the cINN and cFLT capacitors and jumpers:
-<img alt="TUSS4470 schematic" src="/documentation/images/schematic_TUSS4470.png">
+<img alt="TUSS4470 schematic" src="https://barionleg.github.io/open_echo//documentation/images/schematic_TUSS4470.png">
 
 ### Power Supply Options
 The board supports two power input options:
@@ -63,7 +63,7 @@ Use this if you require higher voltage (up to 28V max) for more powerful transdu
 - MT3608 Boost Converter:
 You can add an MT3608 boost converter to your board to generate a higher vDRV from the USB 5V supply. This solution is reliable and works well in many applications, such as powering marine transducers.
 Simply take the MT3608 module (included in the starter kits), secure it to the shield with double-sided tape, and connect the three wires as shown:
-<img alt="TUSS4470 schematic" src="/documentation/images/TUSS4470_MT3608.jpg">
+<img alt="TUSS4470 schematic" src="https://barionleg.github.io/open_echo//documentation/images/TUSS4470_MT3608.jpg">
 
 > [!Tip]
 > To get started, use a 12V power supply. Many ultrasonic transducers operate reliably at this voltage.
